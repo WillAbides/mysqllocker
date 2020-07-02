@@ -4,11 +4,21 @@ jobs:
   cibuild:
     name: cibuild
     runs-on: ubuntu-18.04
+    services:
+      mysql:
+        image: percona:5.7.21
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping --silent"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v2
       - uses: actions/setup-go@v2
         with:
-          go-version: '~1.14.0'
-      - run: script/generate --check
+          go-version: '~1.14.4'
       - run: script/test
-      - run: script/lint
