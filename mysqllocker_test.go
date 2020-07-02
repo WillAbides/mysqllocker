@@ -41,7 +41,7 @@ func getDB(t *testing.T) *sql.DB {
 	addr := mysqlAddr(t)
 	db, err := sql.Open("mysql", fmt.Sprintf("root:@tcp(%s)/", addr))
 	require.NoError(t, err)
-	ctx, cancel := context.WithTimeout(context.Background(), 60 * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	err = mysql.SetLogger(log.New(ioutil.Discard, "", 0))
 	require.NoError(t, err)

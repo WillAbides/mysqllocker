@@ -9,9 +9,9 @@ import (
 
 // Lock gets a named lock from mysql using GET_LOCK() and holds it until ctx is canceled.
 // Returns an error channel that closes when the lock is released by ctx closed or reports an error if the lock cannot be
-//  renewed.
-// Named locks in mysql are good until either they are explicitly released or the session ends. That is why this method creates
-//  a goroutine that continually renews the lock pausing relockInterval between. That prevents the session from being closed for inactivity.
+// renewed. Named locks in mysql are good until either they are explicitly released or the session ends. That is why this
+// method creates a goroutine that continually renews the lock pausing relockInterval between. That prevents the session
+// from being closed for inactivity.
 func Lock(ctx context.Context, db *sql.DB, lockName string, relockInterval time.Duration) (<-chan error, bool, error) {
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -26,7 +26,7 @@ func Lock(ctx context.Context, db *sql.DB, lockName string, relockInterval time.
 
 	errs := make(chan error)
 
-	//launch goroutine to hold the lock on this connection
+	// launch goroutine to hold the lock on this connection
 	go holdLock(ctx, conn, lockName, relockInterval, errs)
 
 	return errs, true, nil
@@ -45,7 +45,7 @@ func holdLock(ctx context.Context, conn *sql.Conn, lockName string, relockInterv
 			haveLock = false
 		case <-ticker.C:
 			haveLock, err = checkLock(ctx, conn, lockName)
-			//If we got an error and the context is closed, we discard the error and break the loop by setting haveLock = false
+			// If we got an error and the context is closed, we discard the error and break the loop by setting haveLock = false
 			if err != nil {
 				haveLock = false
 				if ctx.Err() == nil {
@@ -69,10 +69,10 @@ func holdLock(ctx context.Context, conn *sql.Conn, lockName string, relockInterv
 
 // releaseLock releases the lock named lockName from the given connection
 func releaseLock(conn *sql.Conn, lockName string) error { //nolint:interfacer
-	//use our own context so we can attempt to release a lock even after the calling function's context has been closed
+	// use our own context so we can attempt to release a lock even after the calling function's context has been closed
 	ctx := context.Background()
 	_, err := conn.ExecContext(ctx, `DO RELEASE_LOCK(?)`, lockName)
-	//if the connection is already closed, then the lock is already released and we shouldn't return an error
+	// if the connection is already closed, then the lock is already released and we shouldn't return an error
 	if err == driver.ErrBadConn {
 		err = nil
 	}
@@ -84,7 +84,7 @@ func getLock(ctx context.Context, conn *sql.Conn, lockName string) (bool, error)
 	var gotLock sql.NullBool
 	row := conn.QueryRowContext(ctx, `SELECT GET_LOCK(?, 0)`, lockName)
 	err := row.Scan(&gotLock)
-	//needs to be both Valid and true to return true
+	// needs to be both Valid and true to return true
 	return gotLock.Valid && gotLock.Bool, err
 }
 
@@ -93,6 +93,6 @@ func checkLock(ctx context.Context, conn *sql.Conn, lockName string) (bool, erro
 	var gotLock sql.NullBool
 	row := conn.QueryRowContext(ctx, `SELECT(IS_USED_LOCK(?) = CONNECTION_ID())`, lockName)
 	err := row.Scan(&gotLock)
-	//needs to be both Valid and true to return true
+	// needs to be both Valid and true to return true
 	return gotLock.Valid && gotLock.Bool, err
 }
