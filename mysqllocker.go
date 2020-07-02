@@ -12,13 +12,14 @@ import (
 // renewed. Named locks in mysql are good until either they are explicitly released or the session ends. That is why this
 // method creates a goroutine that continually renews the lock pausing relockInterval between. That prevents the session
 // from being closed for inactivity.
-func Lock(ctx context.Context, db *sql.DB, lockName string, relockInterval time.Duration) (<-chan error, bool, error) {
+// getLockTimeout is the number of seconds to wait for a lock before giving up.
+func Lock(ctx context.Context, db *sql.DB, lockName string, relockInterval time.Duration, getLockTimeout uint) (<-chan error, bool, error) {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return nil, false, err
 	}
 
-	ok, err := getLock(ctx, conn, lockName)
+	ok, err := getLock(ctx, conn, lockName, getLockTimeout)
 	if err != nil || !ok {
 		_ = conn.Close() //nolint:errcheck
 		return nil, false, err
@@ -80,9 +81,9 @@ func releaseLock(conn *sql.Conn, lockName string) error { //nolint:interfacer
 }
 
 // getLock attempts GET_LOCK on the given conn.  Does not attempt to hold the lock.
-func getLock(ctx context.Context, conn *sql.Conn, lockName string) (bool, error) {
+func getLock(ctx context.Context, conn *sql.Conn, lockName string, timeout uint) (bool, error) {
 	var gotLock sql.NullBool
-	row := conn.QueryRowContext(ctx, `SELECT GET_LOCK(?, 0)`, lockName)
+	row := conn.QueryRowContext(ctx, `SELECT GET_LOCK(?, ?)`, lockName, timeout)
 	err := row.Scan(&gotLock)
 	// needs to be both Valid and true to return true
 	return gotLock.Valid && gotLock.Bool, err
