@@ -11,7 +11,7 @@ import (
 // Returns an error channel that closes when the lock is released by ctx closed or reports an error if the lock cannot be
 //  renewed.
 // Named locks in mysql are good until either they are explicitly released or the session ends. That is why this method creates
-//  a goroutine that renews the lock every 10 seconds. That prevents the session from being closed for inactivity.
+//  a goroutine that continually renews the lock pausing relockInterval between. That prevents the session from being closed for inactivity.
 func Lock(ctx context.Context, db *sql.DB, lockName string, relockInterval time.Duration) (<-chan error, bool, error) {
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -79,7 +79,7 @@ func releaseLock(conn *sql.Conn, lockName string) error { //nolint:interfacer
 	return err
 }
 
-// getLock attempts GET_LOCK on the given conn.  Does not attempt to hold the lock.  See dao.GetLock() for that
+// getLock attempts GET_LOCK on the given conn.  Does not attempt to hold the lock.
 func getLock(ctx context.Context, conn *sql.Conn, lockName string) (bool, error) {
 	var gotLock sql.NullBool
 	row := conn.QueryRowContext(ctx, `SELECT GET_LOCK(?, 0)`, lockName)
