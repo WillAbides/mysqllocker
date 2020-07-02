@@ -1,0 +1,13 @@
+name: ci
+on:
+  push:
+    branches:
+      - master
+jobs:
+  cachewarmer:
+    runs-on: ubuntu-18.04
+    steps:
+      - uses: actions/setup-go@v2
+        with:
+          go-version: '~1.14.4'
+      - run: go get github.com/willabides/mysqllocker@master
