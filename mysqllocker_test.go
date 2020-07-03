@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,17 +23,23 @@ func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
-var _mysqlAddr string
+var (
+	_mysqlAddr string
+	setupOnce  sync.Once
+)
 
 func mysqlAddr(t *testing.T) string {
 	t.Helper()
-	addr := os.Getenv("MYSQL_ADDR")
-	if addr != "" {
-		return addr
-	}
-	out, err := exec.Command("docker-compose", "port", "mysql", "3306").Output()
-	require.NoError(t, err)
-	_mysqlAddr = strings.TrimSpace(string(out))
+	setupOnce.Do(func() {
+		_mysqlAddr = os.Getenv("MYSQL_ADDR")
+		if _mysqlAddr != "" {
+			return
+		}
+		out, err := exec.Command("docker-compose", "port", "mysql", "3306").Output()
+		require.NoError(t, err)
+		_mysqlAddr = strings.TrimSpace(string(out))
+		require.NoError(t, mysql.SetLogger(log.New(ioutil.Discard, "", 0)))
+	})
 	return _mysqlAddr
 }
 
@@ -43,8 +50,6 @@ func getDB(t *testing.T) *sql.DB {
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	err = mysql.SetLogger(log.New(ioutil.Discard, "", 0))
-	require.NoError(t, err)
 	for ctx.Err() == nil {
 		err = db.Ping()
 		if err == nil {
@@ -61,94 +66,88 @@ func getDB(t *testing.T) *sql.DB {
 
 func TestLock(t *testing.T) {
 	t.Run("locks", func(t *testing.T) {
-		lockName := "testlock"
+		t.Parallel()
+		lockName := t.Name()
 		db := getDB(t)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		errs, ok, err := Lock(ctx, db, lockName, time.Millisecond, 0)
+		errs, err := Lock(ctx, db, lockName, WithPingInterval(10*time.Millisecond))
 		require.NoError(t, err)
-		require.True(t, ok)
 		require.NotNil(t, errs)
-		time.Sleep(3 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 		cancel()
 		require.NoError(t, <-errs)
 	})
 
 	t.Run("can't get the same lock twice", func(t *testing.T) {
-		lockName := "testlock"
+		t.Parallel()
+		lockName := t.Name()
 		db := getDB(t)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		_, ok, err := Lock(ctx, db, lockName, time.Second, 0)
+		_, err := Lock(ctx, db, lockName)
 		require.NoError(t, err)
-		require.True(t, ok)
-		errs, ok, err := Lock(ctx, db, lockName, time.Second, 0)
-		require.NoError(t, err)
-		require.False(t, ok)
+		errs, err := Lock(ctx, db, lockName)
+		require.Error(t, err)
 		require.Nil(t, errs)
 	})
 
-	t.Run("release and relock", func(t *testing.T) {
-		lockName := "testlock"
+	t.Run("waits for lock", func(t *testing.T) {
+		t.Parallel()
+		lockName := t.Name()
+		db := getDB(t)
+		ctx1, cancel1 := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel1()
+		errs1, err := Lock(ctx1, db, lockName)
+		require.NoError(t, err)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			require.NoError(t, <-errs1)
+			wg.Done()
+		}()
+		ctx2, cancel2 := context.WithCancel(context.Background())
+		errs2, err := Lock(ctx2, db, lockName, WithTimeout(time.Second))
+		require.NoError(t, err)
+		cancel2()
+		require.NoError(t, <-errs2)
+		wg.Wait()
+	})
+
+	t.Run("times out waiting for lock", func(t *testing.T) {
+		t.Parallel()
+		lockName := t.Name()
 		db := getDB(t)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		errs, ok, err := Lock(ctx, db, lockName, time.Second, 0)
+		_, err := Lock(ctx, db, lockName)
 		require.NoError(t, err)
-		require.True(t, ok)
+		timeout := time.Millisecond * 30
+		startTime := time.Now()
+		errs, err := Lock(ctx, db, lockName, WithTimeout(timeout))
+		delta := time.Since(startTime)
+		require.Error(t, err)
+		require.Nil(t, errs)
+		require.Greater(t, int64(delta), int64(timeout))
+	})
+
+	t.Run("release and relock", func(t *testing.T) {
+		t.Parallel()
+		lockName := t.Name()
+		db := getDB(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		errs, err := Lock(ctx, db, lockName)
+		require.NoError(t, err)
 		require.NotNil(t, errs)
 		cancel()
 		require.NoError(t, <-errs)
 		ctx2, cancel2 := context.WithCancel(context.Background())
 		defer cancel2()
-		errs, ok, err = Lock(ctx2, db, lockName, time.Second, 0)
+		errs, err = Lock(ctx2, db, lockName)
 		require.NoError(t, err)
-		require.True(t, ok)
 		require.NotNil(t, errs)
 		cancel2()
 		require.NoError(t, <-errs)
-	})
-}
-
-func Test_checkLock(t *testing.T) {
-	t.Run("no lock", func(t *testing.T) {
-		ctx := context.Background()
-		db := getDB(t)
-		conn, err := db.Conn(ctx)
-		require.NoError(t, err)
-		got, err := checkLock(ctx, conn, "nolocktest")
-		require.NoError(t, err)
-		require.False(t, got)
-	})
-
-	t.Run("conn has lock", func(t *testing.T) {
-		lockName := "connhaslock"
-		ctx := context.Background()
-		db := getDB(t)
-		conn, err := db.Conn(ctx)
-		require.NoError(t, err)
-		ok, err := getLock(ctx, conn, lockName, 0)
-		require.NoError(t, err)
-		require.True(t, ok)
-		got, err := checkLock(ctx, conn, lockName)
-		require.NoError(t, err)
-		require.True(t, got)
-	})
-
-	t.Run("other conn has lock", func(t *testing.T) {
-		lockName := "otherconnhaslock"
-		ctx := context.Background()
-		db := getDB(t)
-		conn1, err := db.Conn(ctx)
-		require.NoError(t, err)
-		conn2, err := db.Conn(ctx)
-		require.NoError(t, err)
-		ok, err := getLock(ctx, conn1, lockName, 0)
-		require.NoError(t, err)
-		require.True(t, ok)
-
-		ok, err = checkLock(ctx, conn2, lockName)
-		require.NoError(t, err)
-		require.False(t, ok)
 	})
 }
