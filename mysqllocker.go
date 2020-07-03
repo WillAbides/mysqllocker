@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"fmt"
 	"time"
 )
 
@@ -13,16 +14,17 @@ import (
 // method creates a goroutine that continually renews the lock pausing relockInterval between. That prevents the session
 // from being closed for inactivity.
 // getLockTimeout is the number of seconds to wait for a lock before giving up.
-func Lock(ctx context.Context, db *sql.DB, lockName string, relockInterval time.Duration, getLockTimeout uint) (<-chan error, bool, error) {
+func Lock(ctx context.Context, db *sql.DB, lockName string, relockInterval time.Duration, getLockTimeout uint) (<-chan error, error) {
 	conn, err := db.Conn(ctx)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
 	ok, err := getLock(ctx, conn, lockName, getLockTimeout)
 	if err != nil || !ok {
 		_ = conn.Close() //nolint:errcheck
-		return nil, false, err
+		err = fmt.Errorf("could not obtain lock")
+		return nil, err
 	}
 
 	errs := make(chan error)
@@ -30,7 +32,7 @@ func Lock(ctx context.Context, db *sql.DB, lockName string, relockInterval time.
 	// launch goroutine to hold the lock on this connection
 	go holdLock(ctx, conn, lockName, relockInterval, errs)
 
-	return errs, true, nil
+	return errs, nil
 }
 
 // holdLock maintains an existing lock on a conn until ctx is canceled or there is an error by periodically checking that
