@@ -8,76 +8,106 @@ import (
 	"time"
 )
 
+const defaultPingInterval = 10 * time.Second
+
+type lockOpts struct {
+	timeout      time.Duration
+	pingInterval time.Duration
+}
+
+// LockOption is an optional value for Lock
+type LockOption func(*lockOpts)
+
+// WithTimeout sets a timeout for Lock to wait before giving up on getting a lock.
+// When unset, Lock will error out immediately if the lock is unavailable.
+func WithTimeout(timeout time.Duration) LockOption {
+	return func(o *lockOpts) {
+		o.timeout = timeout
+	}
+}
+
+// WithPingInterval sets the interval for Lock to ping the connection. Default is 10 seconds.
+func WithPingInterval(pingInterval time.Duration) LockOption {
+	return func(o *lockOpts) {
+		o.pingInterval = pingInterval
+	}
+}
+
 // Lock gets a named lock from mysql using GET_LOCK() and holds it until ctx is canceled.
-// Returns an error channel that closes when the lock is released by ctx closed or reports an error if the lock cannot be
-// renewed. Named locks in mysql are good until either they are explicitly released or the session ends. That is why this
-// method creates a goroutine that continually renews the lock pausing relockInterval between. That prevents the session
-// from being closed for inactivity.
-// getLockTimeout is the duration to wait for a lock before giving up.
-func Lock(ctx context.Context, db *sql.DB, lockName string, relockInterval, getLockTimeout time.Duration) (<-chan error, error) {
+// It pings the db connection at a regular interval to keep it from timing out.
+// If the lock is unavailable and "WithTimeout" is set, it will continue trying until it either times out or obtains a lock.
+// Returns an error channel that will receive an error when the lock is released.
+func Lock(ctx context.Context, db *sql.DB, lockName string, options ...LockOption) (<-chan error, error) {
+	opts := &lockOpts{
+		pingInterval: defaultPingInterval,
+	}
+	for _, o := range options {
+		o(opts)
+	}
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	ok, err := getLock(ctx, conn, lockName, getLockTimeout)
+	ok, err := getLock(ctx, conn, lockName, opts.timeout)
 	if err != nil || !ok {
 		_ = conn.Close() //nolint:errcheck
-		err = fmt.Errorf("could not obtain lock")
+		err = fmt.Errorf("could not obtain lock: %v", err)
 		return nil, err
 	}
+	errs := make(chan error, 1)
 
-	errs := make(chan error)
-
-	// launch goroutine to hold the lock on this connection
-	go holdLock(ctx, conn, lockName, relockInterval, errs)
+	go func() {
+		defer close(errs)
+		ticker := time.NewTicker(opts.pingInterval)
+		defer ticker.Stop()
+		var lErr error
+		for lErr == nil {
+			select {
+			case <-ctx.Done():
+				lErr = ctx.Err()
+			case <-ticker.C:
+				lErr = conn.PingContext(ctx)
+			}
+		}
+		releaseErr := ignoreErr(releaseLock(conn, lockName))
+		if releaseErr != nil {
+			lErr = releaseErr
+		}
+		errs <- ignoreErr(lErr)
+	}()
 
 	return errs, nil
 }
 
-// holdLock maintains an existing lock on a conn until ctx is canceled or there is an error by periodically checking that
-// the lock holder's id is the same as the current connection_id
-func holdLock(ctx context.Context, conn *sql.Conn, lockName string, relockInterval time.Duration, errs chan error) {
-	ticker := time.NewTicker(relockInterval)
+var ignoreableErrs = []error{
+	context.DeadlineExceeded,
+	context.Canceled,
+	sql.ErrConnDone,
+}
 
-	// keep checking that this connection still has the lock every 10s until it doesn't
-	var err error
-	for haveLock := true; haveLock; {
-		select {
-		case <-ctx.Done():
-			haveLock = false
-		case <-ticker.C:
-			haveLock, err = checkLock(ctx, conn, lockName)
-			// If we got an error and the context is closed, we discard the error and break the loop by setting haveLock = false
-			if err != nil {
-				haveLock = false
-				if ctx.Err() == nil {
-					errs <- err
-				}
-			}
+// ignoreErr returns err unless it is one of ignoreableErrs
+func ignoreErr(err error) error {
+	for _, ignoreMe := range ignoreableErrs {
+		if err == ignoreMe {
+			return nil
 		}
 	}
-
-	err = releaseLock(conn, lockName)
-	if err != nil {
-		errs <- err
-	}
-	err = conn.Close()
-	if err != nil && err != sql.ErrConnDone {
-		errs <- err
-	}
-	close(errs)
-	ticker.Stop()
+	return err
 }
 
 // releaseLock releases the lock named lockName from the given connection
-func releaseLock(conn *sql.Conn, lockName string) error { //nolint:interfacer
+func releaseLock(conn *sql.Conn, lockName string) error {
 	// use our own context so we can attempt to release a lock even after the calling function's context has been closed
 	ctx := context.Background()
 	_, err := conn.ExecContext(ctx, `DO RELEASE_LOCK(?)`, lockName)
 	// if the connection is already closed, then the lock is already released and we shouldn't return an error
 	if err == driver.ErrBadConn {
 		err = nil
+	}
+	closeErr := conn.Close()
+	if err == nil {
+		err = closeErr
 	}
 	return err
 }
@@ -93,15 +123,6 @@ func getLock(ctx context.Context, conn *sql.Conn, lockName string, timeout time.
 	}
 	var gotLock sql.NullBool
 	row := conn.QueryRowContext(ctx, `SELECT GET_LOCK(?, ?)`, lockName, waitSeconds)
-	err := row.Scan(&gotLock)
-	// needs to be both Valid and true to return true
-	return gotLock.Valid && gotLock.Bool, err
-}
-
-// checkLock checks whether the given conn holds a named lock. Returns true if it does.
-func checkLock(ctx context.Context, conn *sql.Conn, lockName string) (bool, error) {
-	var gotLock sql.NullBool
-	row := conn.QueryRowContext(ctx, `SELECT(IS_USED_LOCK(?) = CONNECTION_ID())`, lockName)
 	err := row.Scan(&gotLock)
 	// needs to be both Valid and true to return true
 	return gotLock.Valid && gotLock.Bool, err
